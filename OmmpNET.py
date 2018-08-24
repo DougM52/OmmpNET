@@ -539,7 +539,7 @@ class OmmpNET:
         return RspFmt(*self.write_mmap_value(aa,key,1,point))
         
     def get_digital_points_state(self,aa):
-        key = 'Digital Point State'
+        key = 'Bank Read Digital State'
         return RspFmt(*self.read_mmap_value(aa,key))
         
     def activate_digital_points(self,aa,mask):
@@ -594,20 +594,23 @@ class OmmpNET:
         """
         sample routine showing how to set and read back memory map values
         """
-        for i in range(16):
+        # send a power up clear
+        print('sent a power up clear',self.power_up_clear(aa))
+        for i in range(12):
             if i & 4 == 0:
-                self.set_point_type(aa,i,0x180)
-                self.activate_digital_point(aa,i)
-        print('get_digital_state_mask')
-        mask = self.om.test_digital_bank_write(aa)(aa).data
-        print('set_digital_off_mask')
-        self.set_digital_off_mask(aa,mask)
-        print('get_digital_state_mask')
-        mask = self.om.test_digital_bank_write(aa)(aa).data
-        print('set_digital_on_mask')
-        self.set_digital_on_mask(aa,mask)
-        print('get_digital_state_mask')
-        mask = self.get_digital_points_state(aa).data        
+                print('P{:d}.{:d} set to output'.format(i>>2,i&3),self.set_point_type(aa,i,0x180))
+                print('P{:d}.{:d} activated'.format(i>>2,i&3),self.activate_digital_point(aa,i))
+        rsp = self.get_digital_points_state(aa)
+        mask = rsp.data[0]
+        print('get_digital_points_state',rsp)
+        rsp = self.deactivate_digital_points(aa,mask)
+        print('deactivate_digital_points',rsp)
+        rsp = self.get_digital_points_state(aa)
+        print('get_digital_points_state',rsp)
+        rsp = self.activate_digital_points(aa,mask)
+        print('activate_digital_points',rsp)
+        rsp = self.get_digital_points_state(aa)
+        print('get_digital_points_state',rsp)
                 
     def generate_10_hz_sqw_on_point_0(self,aa):
         """
