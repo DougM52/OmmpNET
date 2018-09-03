@@ -27,6 +27,10 @@ from collections import OrderedDict
 from struct import *
 import socket
 import binascii
+import requests
+import OmmpUTL as utl                   # logging and TBD
+
+utl._init()
 
 def prng(ofs,siz=0,cnt=0):
     """
@@ -48,11 +52,6 @@ CmdFmt = namedtuple('CmdFmt',['ofs','len','typ','pak'])
 read/write block/quadlet functions use this
 """
 RspFmt = namedtuple('RspFmt',['rcode','data'])
-
-"""
-change this for testing on other systems
-"""
-aa = ('192.168.10.225',2001)
 
 class OmmpNET:
 
@@ -79,6 +78,9 @@ class OmmpNET:
     """    
     WriteQuadletRequest = namedtuple('WriteQuadletRequest',\
         ['tl','tcode','dofs_hi','dofs_lo','value'])
+
+    WriteQuadletRequestHeader = namedtuple('WriteQuadletRequestHeader',\
+        ['tl','tcode','dofs_hi','dofs_lo'])
 
     WriteQuadletResponse = namedtuple('WriteResponse',\
         ['tl','tcode','rcode'])
@@ -111,6 +113,7 @@ class OmmpNET:
     format strings for packing commands and unpacking responses
     """    
     WriteQuadletRequestFormatString = '!2x2B2xH2I'
+    WriteQuadletRequestHeaderFormatString = '!2x2B2xHI'
     WriteBlockRequestHeaderFormatString = '!2x2B2xHIH2x'
     WriteResponseHeaderFormatString = '!2x2B2xB5x'    
     ReadQuadletRequestFormatString = '!2x2B2xHI'
@@ -118,20 +121,23 @@ class OmmpNET:
     ReadBlockRequestFormatString = '!2x2B2xHIH2x'
     ReadBlockResponseHeaderFormatString = '!2x2B2xB5xH2x'
 
+    @utl.logger
     def get_next_transaction_label(self):
         """
         tl is incremented with each use for potential response verification
         """
         tl = self.transaction_label
-        self.transaction_label += 1
+        self.transaction_label = ((self.transaction_label + 1) & 0x3f)
         return tl
 
+    @utl.logger
     def get_transaction_label(self):
         """
         get the last tl sent
         """
         return self.transaction_label
 
+    @utl.logger
     def write_mmap_value(self,aa,cmd,value,index=0):
         """
         aa -  is the device's UDP address as a tuple, ie:(ip,port)
@@ -144,14 +150,43 @@ class OmmpNET:
         block write is required.
         """
         mmap = self.commands[cmd]
+        if isinstance(value,str):
+            value = value.encode()
         if calcsize(mmap.pak) > 4:
-            return self.write_block_request(aa,mmap,index,value)
+            rsp = self.write_block_request(aa,mmap,index,value)
         else:
-            return self.write_quadlet_request(aa,mmap,index,value)
-            
+            rsp = self.write_quadlet_request(aa,mmap,index,value)
+        return RspFmt(*rsp)
+     
+    @utl.logger
+    def write_n_mmap_values(self,aa,cmd,n,values,idx=0):
+        """
+        Iterate through the commands creating a format specifier
+        for use by write_block_request
+
+        aa     - udp address (ip,port)
+        cmd    - command name string
+        n      - number of parameters to write
+        values - tuple of values
+        idx    - for arrays as in points        
+        """
+        # need to create a python struct unpack format string for the block
+        pak = ''
+        kk = tuple(self.commands.keys())
+        kk = kk[kk.index(cmd):kk.index(cmd)+n]
+        for k in kk:
+            pak += self.commands[k].pak
+        # build a custom command to get the data
+        mmap = self.commands['Read/Write Data Block']
+        mmap = CmdFmt(self.commands[cmd].ofs,calcsize(pak),'',pak)
+        # request the data
+        rsp = self.write_block_request(aa,mmap,idx,values)
+        return RspFmt(*rsp)
+
+    @utl.logger
     def read_mmap_value(self,aa,cmd,index=0):
         """
-        aa -  is the device's UDP address as a tuple, ie:(ip,port)
+        aa -  UDP address, (ip,port)
         cmd - is a key string from the commands OrderedDict
         index - is used to index the prng
 
@@ -161,10 +196,75 @@ class OmmpNET:
         """
         mmap = self.commands[cmd]
         if calcsize(mmap.pak) > 4:
-            return self.read_block_request(aa,mmap,index)
+            rsp = self.read_block_request(aa,mmap,index)
         else:
-            return self.read_quadlet_request(aa,mmap,index)
+            rsp = self.read_quadlet_request(aa,mmap,index)
+        if mmap.typ == 'S-ZT':
+            rsp = (rsp[0],(rsp[1][0].decode().rstrip('\0'),))
+        return RspFmt(*rsp)
 
+    @utl.logger
+    def read_n_mmap_values(self,aa,cmd,n,idx=0):
+        """
+        Iterate through the commands creating a format specifier
+        for use by read_block_request.
+
+        aa  - udp address and port
+        cmd - command name string
+        n   - number of parameters to write
+        idx - for arrays as in points        
+        """
+        # build a custom mmap command for read_block_request
+        # and send it
+        pak = ''
+        kk = tuple(self.commands.keys())
+        kk = kk[kk.index(cmd):kk.index(cmd)+n]
+        for k in kk:
+            pak += self.commands[k].pak
+        mmap = self.commands['Read/Write Data Block']
+        mmap = CmdFmt(self.commands[cmd].ofs,calcsize(pak),'',pak)
+        rsp = RspFmt(*self.read_block_request(aa,mmap,idx))
+        # if command succeeded
+        if rsp.rcode == 0:
+            # spin through the mmap parameter pak strings and 
+            l = []
+            packed = pack(pak,*rsp.data)
+            for k in kk:
+                n = self.commands[k].len
+                t = unpack(self.commands[k].pak,packed[:n])
+                # mmap parameter contains single value
+                if len(t) == 1:
+                    l += [t[0]]
+                # mmap parameter contains multiple values
+                elif len(t) > 1:
+                    l += [t]
+                # discard len characters on the left
+                packed = packed[n:]
+            rsp = (rsp.rcode,tuple(l))
+        return RspFmt(*rsp)
+
+    # used when flattening tuples for passing to pack         
+    t_pack_args = []
+    
+    @utl.logger
+    def flatten_nested_sequences(self,t,start=False):
+        """
+        Need a way to denest nested sequences for packing
+        """
+        if start:
+            self.t_pack_args = []
+        if isinstance(t,(tuple,list)):
+            for i in t:
+                if not isinstance(i,(tuple,list)):
+                    self.t_pack_args += [i]
+                else:
+                    self.flatten_nested_sequences(i)
+        else:
+            self.t_pack_args += [t]
+        return tuple(self.t_pack_args)
+                
+            
+    @utl.logger
     def write_quadlet_request(self,aa,mmap,index,value):
         """
         aa    -  is the device's UDP address as a tuple, ie:(ip,port)
@@ -174,18 +274,25 @@ class OmmpNET:
         """
         tl = self.get_next_transaction_label()
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        txargs = self.WriteQuadletRequest(tl<<2,0<<4,0xffff,mmap.ofs[index],\
-            value)
-        print(txargs)
-        pkt = pack(self.WriteQuadletRequestFormatString,*txargs)
-        print('WriteQuadletRequest',binascii.hexlify(pkt))
+        # create a tuple for passing to pack
+        txargs = self.WriteQuadletRequest(tl<<2,0<<4,0xffff,mmap.ofs[index],value)
+        utl.log_info_message(str(txargs))
+        # if value is a sequence, replace it in txargs with it's contents
+        txargs = self.flatten_nested_sequences(txargs,True)
+        utl.log_info_message(str(txargs))
+        # append the value's pack format string
+        fmt = self.WriteQuadletRequestHeaderFormatString + mmap.pak
+        # finally can create the packet
+        pkt = pack(fmt,*txargs)
+        utl.log_info_message('Request pkt: {}'.format(binascii.hexlify(pkt)))
         s.sendto(pkt,aa)
         d = s.recvfrom(1024)
-        print('WriteResponse',binascii.hexlify(d[0]))
+        utl.log_info_message('Response pkt: {}'.format(binascii.hexlify(d[0])))
         rsp = unpack(self.WriteResponseHeaderFormatString,d[0])
         rsp = self.WriteQuadletResponse(*(rsp[0]>>2,rsp[1]>>4,rsp[2]>>4))
         return (rsp.rcode,self.ecodes[rsp.rcode])
 
+    @utl.logger
     def write_block_request(self,aa,mmap,index,value):
         """
         aa    -  is the device's UDP address as a tuple, ie:(ip,port)
@@ -198,19 +305,26 @@ class OmmpNET:
         """
         tl = self.get_next_transaction_label()
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # create a tuple for passing to pack
         txargs = self.WriteBlockRequest(tl<<2,1<<4,0xffff,mmap.ofs[index],\
             calcsize(mmap.pak),value)
-        print(txargs)
+        utl.log_info_message(str(txargs))
+        # if value is a sequence, replace it in txargs with it's contents
+        txargs = self.flatten_nested_sequences(txargs,True)
+        utl.log_info_message(str(txargs))
+        # append the value's pack format string
         fmt = self.WriteBlockRequestHeaderFormatString + mmap.pak
+        # finally can create the packet
         pkt = pack(fmt,*txargs)
-        print('WriteBlockRequest',binascii.hexlify(pkt))
+        utl.log_info_message('Request: {}'.format(binascii.hexlify(pkt)))
         s.sendto(pkt,aa)
         d = s.recvfrom(1024)
-        print('WriteResponse',binascii.hexlify(d[0]))
+        utl.log_info_message('Response: {}'.format(binascii.hexlify(d[0])))
         rsp = unpack(self.WriteResponseHeaderFormatString,d[0])
         rsp = self.WriteBlockResponse(*(rsp[0]>>2,rsp[1]>>4,rsp[2]>>4))
         return (rsp.rcode,self.ecodes[rsp.rcode])
 
+    @utl.logger
     def read_quadlet_request(self,aa,mmap,index):
         """
         aa    -  is the device's UDP address as a tuple, ie:(ip,port)
@@ -220,22 +334,31 @@ class OmmpNET:
         tl = self.get_next_transaction_label()
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         txargs = self.ReadQuadletRequest(*(tl<<2,4<<4,0xffff,mmap.ofs[index]))
-        print(txargs)
+        utl.log_info_message(str(txargs))
         pkt = pack(self.ReadQuadletRequestFormatString,*txargs)
-        print('ReadQuadletRequest',binascii.hexlify(pkt))
+        utl.log_info_message('Request: {}'.format(binascii.hexlify(pkt)))
         s.sendto(pkt,aa)
         d = s.recvfrom(1024)
-        print('ReadQuadletResponse',binascii.hexlify(d[0]))
-        # is rcode == 0?
-        rsp = unpack(self.ReadQuadletResponseHeaderFormatString,d[0]\
-            [:calcsize(self.ReadQuadletResponseHeaderFormatString)])
+        utl.log_info_message('Response: {}'.format(binascii.hexlify(d[0])))
+        # get the header
+        fmt = self.ReadQuadletResponseHeaderFormatString
+        rsp = unpack_from(fmt,d[0])
+        # copy to namedtuple
         rsp = self.ReadQuadletResponseHeader(*(rsp[0]>>2,rsp[1]>>4,rsp[2]>>4))
+        # check for success
         if rsp.rcode == 0:
-            return (rsp.rcode,unpack('!'+mmap.pak,d[0][calcsize(\
-                self.ReadQuadletResponseHeaderFormatString):]))
+            # get the data as well
+            fmt += mmap.pak
+            rsp = unpack_from(fmt,d[0])
+            # copy to named tuple
+            rsp = self.ReadQuadletResponse(*(rsp[0]>>2,rsp[1]>>4,rsp[2]>>4,rsp[3:]))
+            # return the value
+            return (rsp.rcode,rsp.value)
+        # return the error
         else:
             return (rsp.rcode,self.ecodes[rsp.rcode])
             
+    @utl.logger
     def read_block_request(self,aa,mmap,index):
         """
         aa    -  is the device's UDP address as a tuple, ie:(ip,port)
@@ -250,21 +373,28 @@ class OmmpNET:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         txargs = self.ReadBlockRequest(*(tl<<2,5<<4,0xffff,\
             mmap.ofs[index],calcsize(mmap.pak)))
-        print(txargs)
+        utl.log_info_message(str(txargs))
         pkt = pack(self.ReadBlockRequestFormatString,*txargs)
-        print('ReadBlockRequest',binascii.hexlify(pkt))
+        utl.log_info_message('Request: {}'.format(binascii.hexlify(pkt)))
         s.sendto(pkt,aa)
         d = s.recvfrom(1024)
-        print('ReadBlockResponse',binascii.hexlify(d[0]))
+        utl.log_info_message('Response: {}'.format(binascii.hexlify(d[0])))
         # get the ReadBlockResponseHeader
-        rsp = unpack(self.ReadBlockResponseHeaderFormatString,\
-            d[0][:calcsize(self.ReadBlockResponseHeaderFormatString)])
+        fmt = self.ReadBlockResponseHeaderFormatString
+        rsp = unpack_from(fmt,d[0])
         rsp = self.ReadBlockResponseHeader(*(rsp[0]>>2,rsp[1]>>4,\
             rsp[2]>>4,rsp[3]))
         # is rcode == 0?
         if rsp.rcode == 0:
-            return (rsp.rcode,unpack('!'+mmap.pak,d[0][calcsize(\
-                self.ReadBlockResponseHeaderFormatString):]))
+            # repeat unpack with data
+            fmt += mmap.pak
+            rsp = unpack_from(fmt,d[0])
+            # build namedtuple
+            rsp = self.ReadBlockResponse(*(rsp[0]>>2,rsp[1]>>4,\
+                rsp[2]>>4,rsp[3],rsp[4:]))
+            # return response
+            return (rsp.rcode,rsp.value)
+        # return error
         else:
             return (rsp.rcode,self.ecodes[rsp.rcode])
 
@@ -471,27 +601,38 @@ class OmmpNET:
         'Boot to loader':0x87654321
         }
     
+    @utl.logger
     def power_up_clear(self,aa):
         key = 'Status R/W Operation Code'
         opc = self.operation_codes['Send Powerup Clear']
         return RspFmt(*self.write_mmap_value(aa,key,opc))
 
+    @utl.logger
     def get_unit_type(self,aa):
         key = 'Status Read Device Unit Type'
         return RspFmt(*self.read_mmap_value(aa,key))
 
+    @utl.logger
+    def set_module_type(self,aa,point,typ):
+        key = 'Point Module Type'
+        return RspFmt(*self.write_mmap_value(aa,key,typ,point))
+
+    @utl.logger
     def get_module_type(self,aa,point):
         key = 'Point Module Type'
         return RspFmt(*self.read_mmap_value(aa,key,point))
 
+    @utl.logger
     def get_mmap_version(self,aa):
         key = 'Status Read Memory Map Version'
         return RspFmt(*self.read_mmap_value(aa,key))
     
+    @utl.logger
     def get_firmware_version(self,aa):
         key = 'Status Read Firmware Version'
         return RspFmt(*self.read_mmap_value(aa,key))
     
+    @utl.logger
     def get_firmware_version_string(self,aa):
         key = 'Status Read Firmware Version'
         rsp = RspFmt(*self.read_mmap_value(aa,key))
@@ -504,154 +645,255 @@ class OmmpNET:
             return RspFmt(*(rsp.rcode,VersionString))
         return RspFmt(*rsp)
         
+    @utl.logger
     def get_power_up_clear_required_flag(self,aa):
         key = 'Status Read Powerup Clear Flag'
         return RspFmt(*self.read_mmap_value(aa,key))
 
+    @utl.logger
     def get_busy_flag(self,aa):
         key = 'Status Read Busy Flag'
         return RspFmt(*self.read_mmap_value(aa,key))
     
+    @utl.logger
     def get_last_error(self,aa):
         key = 'Status Read Last Error code'
         return RspFmt(*self.read_mmap_value(aa,key))
 
+    @utl.logger
     def get_mac_address(self,aa):
         # 00-A0-3D-00-0D-D8
         # (0, 160, 61, 0, 13, 216)
         key = 'Status Read MAC Address'
         return RspFmt(*self.read_mmap_value(aa,key))
 
+    @utl.logger
     def set_point_type(self,aa,point,typ):
         key = 'Point Type'
         return RspFmt(*self.write_mmap_value(aa,key,typ,point))
 
+    @utl.logger
     def get_point_type(self,aa,point):
         key = 'Point Type'
         return RspFmt(*self.read_mmap_value(aa,key,point))
 
+    @utl.logger
     def activate_digital_point(self,aa,point):
         key = 'Digital Point Activate'
         return RspFmt(*self.write_mmap_value(aa,key,1,point))
 
+    @utl.logger
     def deactivate_digital_point(self,aa,point):
         key = 'Digital Point Deactivate'                        
         return RspFmt(*self.write_mmap_value(aa,key,1,point))
         
+    @utl.logger
     def get_digital_points_state(self,aa):
-        key = 'Bank Read Digital State'
+        key = 'Digital Bank Read State'
         return RspFmt(*self.read_mmap_value(aa,key))
         
+    @utl.logger
     def activate_digital_points(self,aa,mask):
         key = 'Digital Bank Point Activate Mask'
         return RspFmt(*self.write_mmap_value(aa,key,mask))
 
+    @utl.logger
     def deactivate_digital_points(self,aa,mask):
         key = 'Digital Bank Point Deactivate Mask'
         return RspFmt(*self.write_mmap_value(aa,key,mask))
 
+    @utl.logger
     def set_timer_delay(self,aa,timer,period):
         key = 'Timer Delay'           
         return RspFmt(*self.write_mmap_value(aa,key,period,timer))
         
+    @utl.logger
     def get_timer_delay(self,aa,timer):
         key = 'Timer Delay'           
         return RspFmt(*self.read_mmap_value(aa,key,timer))
 
+    @utl.logger
     def set_timer_trigger_on_mask(self,aa,timer,mask):
         key = 'Timer Start Input On Mask'
         return RspFmt(*self.write_mmap_value(aa,key,mask,timer))
 
+    @utl.logger
     def get_timer_trigger_on_mask(self,aa,timer):
         key = 'Timer Start Input On Mask'
         return RspFmt(*self.read_mmap_value(aa,key,timer))
 
+    @utl.logger
     def set_timer_trigger_off_mask(self,aa,timer,mask):
         key = 'Timer Start Input Off Mask'
         return RspFmt(*self.write_mmap_value(aa,key,mask,timer))
 
+    @utl.logger
     def get_timer_trigger_off_mask(self,aa,timer):
         key = 'Timer Start Input Off Mask'
         return RspFmt(*self.read_mmap_value(aa,key,timer))
 
+    @utl.logger
     def set_timer_reaction_on_mask(self,aa,timer,mask):
         key = 'Timer Expired Output On Mask'
         return RspFmt(*self.write_mmap_value(aa,key,mask,timer))
 
+    @utl.logger
     def get_timer_reaction_on_mask(self,aa,timer):
         key = 'Timer Expired Output On Mask'
         return RspFmt(*self.read_mmap_value(aa,key,timer))
 
+    @utl.logger
     def set_timer_reaction_off_mask(self,aa,timer,mask):
         key = 'Timer Expired Output Off Mask'
         return RspFmt(*self.write_mmap_value(aa,key,mask,timer))
 
+    @utl.logger
     def get_timer_reaction_off_mask(self,aa,timer):
         key = 'Timer Expired Output Off Mask'
         return RspFmt(*self.read_mmap_value(aa,key,timer))
 
-    def test_digital_bank_write(self,aa):
-        """
-        sample routine showing how to set and read back memory map values
-        """
-        # send a power up clear
-        print('sent a power up clear',self.power_up_clear(aa))
-        for i in range(12):
-            if i & 4 == 0:
-                print('P{:d}.{:d} set to output'.format(i>>2,i&3),self.set_point_type(aa,i,0x180))
-                print('P{:d}.{:d} activated'.format(i>>2,i&3),self.activate_digital_point(aa,i))
-        rsp = self.get_digital_points_state(aa)
-        mask = rsp.data[0]
-        print('get_digital_points_state',rsp)
-        rsp = self.deactivate_digital_points(aa,mask)
-        print('deactivate_digital_points',rsp)
-        rsp = self.get_digital_points_state(aa)
-        print('get_digital_points_state',rsp)
-        rsp = self.activate_digital_points(aa,mask)
-        print('activate_digital_points',rsp)
-        rsp = self.get_digital_points_state(aa)
-        print('get_digital_points_state',rsp)
-                
-    def generate_10_hz_sqw_on_point_0(self,aa):
-        """
-        cfg p0.0 as a digital output
-        deactivate p0.0
-        set timer 0 delay to 50ms
-        set timer 0 start event on activation of P0.0
-        set timer 0 reaction event to turn off P0.0
-        set timer 1 delay to 50ms
-        set timer 1 start event to P0.0 clear
-        set timer 1 reaction event to set P0.0
-        activate p0.0 to start squarewave
-        """
-        # send a power up clear
-        print('send a power up clear',self.power_up_clear(aa))
-        # Set first point to an Output
-        print('make digital point 0 an output',self.set_point_type(aa,0,0x180))
-        # turn Off point P0.0
-        print('turn off digital point 0',self.deactivate_digital_point(aa,0))
-        # Set up a 50ms timer
-        print('set t0 delay',self.set_timer_delay(aa,0,50))
-        print('get t0 delay',self.get_timer_delay(aa,0))
-        # start it when P0.0 Sets
-        print('set t0 trigger on mask',self.set_timer_trigger_on_mask(aa,0,1))
-        print('get t0 trigger on mask',self.get_timer_trigger_on_mask(aa,0))
-        # use Event to clear P0.0
-        print('set t0 reaction off mask',self.set_timer_reaction_off_mask(aa,0,1))
-        print('get t0 reaction off mask',self.get_timer_reaction_off_mask(aa,0))
-        # Set up a 50ms timer
-        print('set t1 delay',self.set_timer_delay(aa,1,50))
-        print('get t1 delay',self.get_timer_delay(aa,1))
-        # start it when P0.0 clears
-        print('set t1 trigger off mask',self.set_timer_trigger_off_mask(aa,1,1))
-        print('get t1 trigger off mask',self.get_timer_trigger_off_mask(aa,1))
-        # use Event to Set P0.0
-        print('set t1 reaction on mask',self.set_timer_reaction_on_mask(aa,1,1))
-        print('get t1 reaction on mask',self.get_timer_reaction_on_mask(aa,1))
-        # turn On P0.0 to start timer 0
-        print('turn on digital point 0 to start sqw',self.activate_digital_point(aa,0))
+    @utl.logger
+    def get_mail_server_ip_address(self,url):
+        # ('EMAIL SMTP Mail Server IP Address',CmdFmt(prng(0xf1300000),4,'IP','4B')),
+        external_ip = urllib.request.urlopen(url).read().decode('utf8')
+        print(external_ip)
 
-                
+    @utl.logger
+    def set_email_to_address(self,aa,recipient):
+        # ('EMAIL TO: Address',CmdFmt(prng(0xf1300008),50,'S-ZT','50s')),
+        return RspFmt(*self.write_mmap_value(aa,'EMAIL TO: Address',recipient))        
+        
+    @utl.logger
+    def get_email_to_address(self,aa):
+        # ('EMAIL TO: Address',CmdFmt(prng(0xf1300008),50,'S-ZT','50s')),
+        return RspFmt(*self.read_mmap_value(aa,'EMAIL TO: Address'))
+
+    @utl.logger
+    def set_email_server_port(self,aa,port):
+        # ('EMAIL SMTP Mail Server Port Number',CmdFmt(prng(0xf1300004),4,'UI','I')),
+        return RspFmt(*self.write_mmap_value(aa,'EMAIL SMTP Mail Server Port Number',port))
+
+    @utl.logger
+    def get_email_server_port(self,aa):
+        # ('EMAIL SMTP Mail Server Port Number',CmdFmt(prng(0xf1300004),4,'UI','I')),
+        return RspFmt(*self.read_mmap_value(aa,'EMAIL SMTP Mail Server Port Number'))
+
+    @utl.logger
+    def set_email_from_address(self,aa,sender):
+        # ('EMAIL FROM: I/O Unit',CmdFmt(prng(0xf130003A),50,'S-ZT','50s')),
+        return RspFmt(*self.write_mmap_value(aa,'EMAIL TO: Address',sender))        
+        
+    @utl.logger
+    def get_email_from_address(self,aa):
+        # ('EMAIL FROM: I/O Unit',CmdFmt(prng(0xf130003A),50,'S-ZT','50s')),
+        return RspFmt(*self.read_mmap_value(aa,'EMAIL TO: Address'))        
+
+    @utl.logger
+    def set_email_subject(self,aa,subject):
+        # ('EMAIL RE: Subject',CmdFmt(prng(0xf130006C),50,'S-ZT','50s')),
+        return RspFmt(*self.write_mmap_value(aa,'EMAIL RE: Subject',subject))
+
+    @utl.logger
+    def get_email_subject(self,aa):
+        # ('EMAIL RE: Subject',CmdFmt(prng(0xf130006C),50,'S-ZT','50s')),
+        return RspFmt(*self.read_mmap_value(aa,'EMAIL RE: Subject'))
+
+    @utl.logger
+    def set_email_message_text(self,aa,index,message):
+        # ('Event Message Text',CmdFmt(prng(0xf1200040,192,128),128,'S-ZT','128s')),
+        return RspFmt(*self.write_mmap_value(aa,'Event Message Text',message,index))
+
+    @utl.logger
+    def get_email_message_text(self,aa,index):
+        # ('Event Message Text',CmdFmt(prng(0xf1200040,192,128),128,'S-ZT','128s')),
+        return RspFmt(*self.read_mmap_value(aa,'Event Message Text',index))
+
+    @utl.logger
+    def set_scratch_pad_bits_on_event_mask(self,aa,index,mask):        
+        # ('Event Message Scratch Pad Bits On Mask',CmdFmt(prng(0xf1200004,192,128),8,'M','Q')),
+        return RspFmt(*self.write_mmap_value(aa,'Event Message Scratch Pad Bits On Mask',mask,index))
+
+    @utl.logger
+    def get_scratch_pad_bits_on_event_mask(self,aa,index):        
+        # ('Event Message Scratch Pad Bits On Mask',CmdFmt(prng(0xf1200004,192,128),8,'M','Q')),
+        return RspFmt(*self.read_mmap_value(aa,'Event Message Scratch Pad Bits On Mask',index))
+
+    @utl.logger
+    def set_scratch_pad_bits_off_event_mask(self,aa,index,mask):        
+        # ('Event Message Scratch Pad Bits Off Mask',CmdFmt(prng(0xf120000c,192,128),8,'M','Q')),
+        return RspFmt(*self.write_mmap_value(aa,'Event Message Scratch Pad Bits Off Mask',mask,index))
+
+    @utl.logger
+    def get_scratch_pad_bits_off_event_mask(self,aa,index):        
+        # ('Event Message Scratch Pad Bits Off Mask',CmdFmt(prng(0xf120000c,192,128),8,'M','Q')),
+        return RspFmt(*self.read_mmap_value(aa,'Event Message Scratch Pad Bits Off Mask',index))
+    
+    @utl.logger
+    def set_email_enable(self,aa,index,enable):
+        # ('Event Message Enable EMail',CmdFmt(prng(0xf120001C,192,128),4,'B','I')),
+        return RspFmt(*self.write_mmap_value(aa,'Event Message Enable EMail',enable,index))
+
+    @utl.logger
+    def get_email_enable(self,aa,index):
+        # ('Event Message Enable EMail',CmdFmt(prng(0xf120001C,192,128),4,'B','I')),
+        return RspFmt(*self.read_mmap_value(aa,'Event Message Enable EMail',index))
+
+    @utl.logger
+    def get_scratch_pad_bits(self,aa):
+        # ('Scratch Pad bit state',CmdFmt(prng(0xF0D80000),8,'M','Q')),
+        return RspFmt(*self.read_mmap_value(aa,'Scratch Pad bit state'))
+        
+    @utl.logger
+    def set_scratch_pad_bits(self,aa,mask):
+        # ('Scratch Pad bit On mask',CmdFmt(prng(0xF0D80400),8,'M','Q')),
+        return RspFmt(*self.write_mmap_value(aa,'Scratch Pad bit On mask',mask))
+        
+    @utl.logger
+    def clr_scratch_pad_bits(self,aa,mask):
+        # ('Scratch Pad bit Off mask',CmdFmt(prng(0xF0D80408),8,'M','Q')),
+        return RspFmt(*self.write_mmap_value(aa,'Scratch Pad bit Off mask',mask))       
+
+    @utl.logger
+    def set_event_message_state(self,aa,index,value):
+        # ('Event Message Current State',CmdFmt(prng(0xf1200000,192,128),4,'UI','I')),
+        return RspFmt(*self.write_mmap_value(aa,'Event Message Current State',value,index))       
+
+    @utl.logger
+    def get_event_message_state(self,aa,index):
+        # ('Event Message Current State',CmdFmt(prng(0xf1200000,192,128),4,'UI','I')),
+        return RspFmt(*self.read_mmap_value(aa,'Event Message Current State',index))       
+        
+    @utl.logger
+    def set_email_response_timeout(self,aa,value):
+        # ('EMAIL Response Timeout',CmdFmt(prng(0xf13000A0),4,'UI','I')),
+        return RspFmt(*self.write_mmap_value(aa,'EMAIL Response Timeout',value,index))       
+        
+    @utl.logger
+    def get_email_response_timeout(self,aa):
+        # ('EMAIL Response Timeout',CmdFmt(prng(0xf13000A0),4,'UI','I')),
+        return RspFmt(*self.read_mmap_value(aa,'EMAIL Response Timeout'))       
+
+    @utl.logger
+    def set_analog_value_in_eu(self,aa,point,value):
+        # ('Analog Read/Write Output in EU',CmdFmt(prng(0xf0b00000,64,64),4,'F','f'))
+        return RspFmt(*self.write_mmap_value(aa,'Analog Read/Write Value in EU',value,point))       
+
+    @utl.logger
+    def get_analog_value_in_eu(self,aa,point):
+        # ('Analog Read/Write Output in EU',CmdFmt(prng(0xf0b00000,64,64),4,'F','f'))
+        return RspFmt(*self.read_mmap_value(aa,'Analog Read/Write Value in EU',point))       
+
+    @utl.logger
+    def set_analog_value_in_counts(self,aa,point,value):
+        # ('Analog Read/Write Output in Counts',CmdFmt(prng(0xf0b00000,64,64),4,'F','f'))
+        return RspFmt(*self.write_mmap_value(aa,'Analog Read/Write Value in Counts',value,point))       
+
+    @utl.logger
+    def get_analog_value_in_counts(self,aa,point):
+        # ('Analog Read/Write Output in Counts',CmdFmt(prng(0xf0b00000,64,64),4,'F','f'))
+        return RspFmt(*self.read_mmap_value(aa,'Analog Read/Write Value in Counts',point))       
+                               
+
     """
     Momory Map information for building and parsing Data
     CmdFmt = namedtuple('CmdFmt',['ofs','len','typ','pak'])
@@ -661,7 +903,10 @@ class OmmpNET:
         pak - Python pack/unpack type for the OptoMMP type and len
             
     """
-    commands = OrderedDict([        
+    commands = OrderedDict([
+        # create a bogus command that can be filled in to read/write a data block
+        ('Read/Write Data Block',CmdFmt(0,0,'?','')),
+
         # (EXPANDED) Analog & Digital POINT Cfg—READ/WRITE
         # 64 Points per Module for 64 Modules for 4096 points
         ('PointEX Module Type',CmdFmt(prng(0xf0100000,192,4096),4,'UI','I')),
@@ -947,21 +1192,21 @@ class OmmpNET:
         ('0xF03A9418',CmdFmt(prng(0xF03A9418,48,16),24,'-','24x')),
 
         # SNMP CONFIGURATION—READ/WRITE
-        ('sysName—device name',CmdFmt(prng(0xF03C0000),32,'S-ZT','32s')),
-        ('sysLocation—device location',CmdFmt(prng(0xF03C0020),32,'S-ZT','32s')),
-        ('sysContact—owner ID',CmdFmt(prng(0xF03C0040),32,'S-ZT','32s')),
-        ('Enable authentication trap',CmdFmt(prng(0xF03C0060),4,'UI','I')),
-        ('Enable cold start trap',CmdFmt(prng(0xF03C0064),4,'UI','I')),
+        ('SNMP sysName',CmdFmt(prng(0xF03C0000),32,'S-ZT','32s')),
+        ('SMNP sysLocation',CmdFmt(prng(0xF03C0020),32,'S-ZT','32s')),
+        ('SMNP sysContact',CmdFmt(prng(0xF03C0040),32,'S-ZT','32s')),
+        ('SMNP Enable Authentication Trap',CmdFmt(prng(0xF03C0060),4,'UI','I')),
+        ('SMNP Enable Cold Start Trap',CmdFmt(prng(0xF03C0064),4,'UI','I')),
         
         # 8 communities
-        ('Community Name',CmdFmt(prng(0xF03C0068,32,8),20,'S-ZT','20s')),
-        ('Community read access privileges.',CmdFmt(prng(0xF03C007C,32,8),4,'UI','I')),
-        ('Community Set write access privileges.',CmdFmt(prng(0xF03C0080,32,8),4,'UI','I')),
-        ('Community Set trap access privileges.',CmdFmt(prng(0xF03C0084,32,8),4,'UI','I')),
+        ('SNMP Community Name',CmdFmt(prng(0xF03C0068,32,8),20,'S-ZT','20s')),
+        ('SNMP Community read access privileges.',CmdFmt(prng(0xF03C007C,32,8),4,'UI','I')),
+        ('SNMP Community Set write access privileges.',CmdFmt(prng(0xF03C0080,32,8),4,'UI','I')),
+        ('SNMP Community Set trap access privileges.',CmdFmt(prng(0xF03C0084,32,8),4,'UI','I')),
         
         # 16 Hosts
-        ('Host Community',CmdFmt(prng(0xF03C0168,24,16),20,'S-ZT','20s')),
-        ('Host IP address',CmdFmt(prng(0xF03C017C,24,16),4,'IP','4B')),
+        ('SNMP Host Community',CmdFmt(prng(0xF03C0168,24,16),20,'S-ZT','20s')),
+        ('SNMP Host IP address',CmdFmt(prng(0xF03C017C,24,16),4,'IP','4B')),
         # 1 trap
         ('SNMP trap destination port',CmdFmt(prng(0xF03C0308),4,'UI','I')),
         ('SNMP trap version',CmdFmt(prng(0xF03C030C),4,'UI','I')),
@@ -1035,12 +1280,12 @@ class OmmpNET:
         ('Stream Destination IP address',CmdFmt(prng(0xF03FFFE0),4,'IP','4B')),
 
         # Digital BANK READ—READ ONLY
-        ('Bank Read Digital State',CmdFmt(prng(0xF0400000),8,'M','Q')),
-        ('Bank Read Digital On Latches',CmdFmt(prng(0xF0400008),8,'M','Q')),
-        ('Bank Read Digital Off Latches',CmdFmt(prng(0xF0400010),8,'M','Q')),
-        ('Bank Read Digital Counters State',CmdFmt(prng(0xF0400018),8,'M','Q')),
-        ('Bank Read Digital Pulse Measurement Complete',CmdFmt(prng(0xF0400020),8,'M','Q')),
-        ('Bank Read Counter Data',CmdFmt(prng(0xF0400100),256,'UI','64I')),
+        ('Digital Bank Read State',CmdFmt(prng(0xF0400000),8,'M','Q')),
+        ('Digital Bank Read On Latches',CmdFmt(prng(0xF0400008),8,'M','Q')),
+        ('Digital Bank Read Off Latches',CmdFmt(prng(0xF0400010),8,'M','Q')),
+        ('Digital Bank Read Counters State',CmdFmt(prng(0xF0400018),8,'M','Q')),
+        ('Digital Bank Read Pulse Measurement Complete',CmdFmt(prng(0xF0400020),8,'M','Q')),
+        ('Digital Bank Read Counter Data',CmdFmt(prng(0xF0400100),256,'UI','64I')),
         
         # Digital BANK WRITE—READ/WRITE
         ('Digital Bank Point Activate Mask',CmdFmt(prng(0xF0500000),8,'M','Q')),
@@ -1049,14 +1294,14 @@ class OmmpNET:
         ('Digital Bank Counters Deactivate Mask',CmdFmt(prng(0xF0500018),8,'M','Q')),
 
         # Analog BANK READ—READ OnLY
-        ('Analog Data in EU',CmdFmt(prng(0xF0600000),256,'F','64f')),
-        ('Analog Data in Counts',CmdFmt(prng(0xF0600100),256,'F','64f')),
-        ('Analog Min Value in EU',CmdFmt(prng(0xF0600200),256,'F','64f')),
-        ('Analog Max Value in EU',CmdFmt(prng(0xF0600300),256,'F','64f')),
+        ('Analog Bank Data in EU',CmdFmt(prng(0xF0600000),256,'F','64f')),
+        ('Analog Bank Data in Counts',CmdFmt(prng(0xF0600100),256,'F','64f')),
+        ('Analog Bank Min Value in EU',CmdFmt(prng(0xF0600200),256,'F','64f')),
+        ('Analog Bank Max Value in EU',CmdFmt(prng(0xF0600300),256,'F','64f')),
 
         # Analog BANK WRITE—READ/WRITE
-        ('Analog Output in EU',CmdFmt(prng(0xF0700000),256,'F','64f')),
-        ('Analog Outputin Counts',CmdFmt(prng(0xF0700100),256,'F','64f')),
+        ('Analog Bank Output in EU',CmdFmt(prng(0xF0700000),256,'F','64f')),
+        ('Analog Bank Output in Counts',CmdFmt(prng(0xF0700100),256,'F','64f')),
 
         # Digital POINT READ—READ OnLY
         # 64 Points On 0x40 boundary
@@ -1084,8 +1329,8 @@ class OmmpNET:
         
         # (OLD) Analog POINT WRITE—READ/WRITE
         # 64 blocks of 64 bytes,
-        ('Analog Read/Write Output in EU',CmdFmt(prng(0xf0b00000,64,64),4,'F','f')),
-        ('Analog Read/Write Output in Counts',CmdFmt(prng(0xf0b00004,64,64),4,'F','f')),
+        ('Analog Read/Write Value in EU',CmdFmt(prng(0xf0b00000,64,64),4,'F','f')),
+        ('Analog Read/Write Value in Counts',CmdFmt(prng(0xf0b00004,64,64),4,'F','f')),
         ('Analog Read/Write TPO Resolution',CmdFmt(prng(0xf0b00008,64,64),4,'F','f')),
         ('Analog Read/Write TPO Period in Seconds',CmdFmt(prng(0xf0b0000c,64,64),4,'F','f')),
         ('0xf0b00010',CmdFmt(prng(0xf0b00010,64,64),4,'-','4x')),
@@ -1148,18 +1393,23 @@ class OmmpNET:
         # CUSTOM Cfg AREA—WRITE
         # first element of 1024 elements
         # creates a scatter write gather read like custom memory area
-        ('Configure Custom Data',CmdFmt(prng(0xf0d50000,4,1024),4,'UI','I')),
+        ('Custom Configure Data',CmdFmt(prng(0xf0d50000,4,1024),4,'UI','I')),
         
         # Custom Data ACCESS AREA—READ/WRITE
         # first element of 1024 elements
         # accesses a scatter write gather read like custom memory area
-        ('Access Custom Data',CmdFmt(prng(0xf0d60000,4,1024),4,'*','TBD')),
+        ('Custom Access Data',CmdFmt(prng(0xf0d60000,4,1024),4,'*','TBD')),
 
         # SCRATCH PAD—READ/WRITE
         # 64 bits 
         ('Scratch Pad bit state',CmdFmt(prng(0xF0D80000),8,'M','Q')),
-        ('Scratch Pad bit On mask',CmdFmt(prng(0xF0D80400),8,'M','Q')),
-        ('Scratch Pad bit Off mask',CmdFmt(prng(0xF0D80408),8,'M','Q')),
+        ('Scratch Pad bit On mask',CmdFmt(prng(0xF0D80400),16,'M','Q8x')),
+        ('Scratch Pad bit Off mask',CmdFmt(prng(0xF0D80400),16,'M','8xQ')),
+##        Apparently one has to write these masks simultaneously because
+##        ioManager does it and if I do it it starts working. Q size writes
+##        don't work
+##        ('Scratch Pad bit On mask',CmdFmt(prng(0xF0D80400),8,'M','Q')),
+##        ('Scratch Pad bit Off mask',CmdFmt(prng(0xF0D80408),8,'M','Q')),
         # 1024 32-bit integer values
         ('Scratch Pad 32-bit Integer value',CmdFmt(prng(0xF0D81000,4,1024),4,'I','i')),
         # 1024 floating point values
@@ -1176,23 +1426,23 @@ class OmmpNET:
 
         # (OLD) Analog POINT CALCULATIOn AND Set—READ OnLY
         # 64 floating Point Offset Values
-        ('Offset in EU',CmdFmt(prng(0xf0e00000,4,64),4,'F','f')),
+        ('Analog Read Offset in EU',CmdFmt(prng(0xf0e00000,4,64),4,'F','f')),
         # 64 floating Point gain Values
-        ('Offset in EU',CmdFmt(prng(0xf0e00100,4,64),4,'F','f')),
+        ('Analog Read Gain in EU',CmdFmt(prng(0xf0e00100,4,64),4,'F','f')),
 
         #(OLD) Digital READ AND CLEAR—READ OnLY
         # 64 UI Count Values
-        ('Counts',CmdFmt(prng(0xf0f00000,4,64),4,'UI','I')),      
+        ('Digital Read and Clear Counts',CmdFmt(prng(0xf0f00000,4,64),4,'UI','I')),      
         # 64 4 Boolean Values
-        ('On Latch',CmdFmt(prng(0xf0f00100,4,64),4,'B','I')),
+        ('Digital Read and Clear On Latches',CmdFmt(prng(0xf0f00100,4,64),4,'B','I')),
         # 64 4 Boolean Values
-        ('Off Latch',CmdFmt(prng(0xf0f00200,4,64),4,'B','I')),
+        ('Digital Read and Clear Off Latches',CmdFmt(prng(0xf0f00200,4,64),4,'B','I')),
 
         # (OLD) Analog READ AND CLEAR/RESTART—READ OnLY
         # 64 Minimum Values
-        ('Analog Minimum Value',CmdFmt(prng(0xf0f80000,4,64),4,'F','f')),
+        ('Analog Read and Clear Minimum Value',CmdFmt(prng(0xf0f80000,4,64),4,'F','f')),
         # 64 Maximum Values
-        ('Analog Maximum Value',CmdFmt(prng(0xf0f80100,4,64),4,'F','f')),
+        ('Analog Read and Clear Maximum Value',CmdFmt(prng(0xf0f80100,4,64),4,'F','f')),
 
         # Streaming—READ OnLY
         ('Stream Analog Values in EU',CmdFmt(prng(0xf1000000),256,'F','64f')),
@@ -1205,57 +1455,57 @@ class OmmpNET:
         # Digital PACKED DATA—READ
         # 32 Points per Module
         # 0x80 Module boundary
-        ('HD Digital Packed Counters',CmdFmt(prng(0xf1001000,128,128),4,'UI','I')),
-        ('HD Digital Packed Flags and State',CmdFmt(prng(0xf1001800,128,128),4,'UI','I')),
+        ('HD Digital Read Packed Counters',CmdFmt(prng(0xf1001000,128,128),4,'UI','I')),
+        ('HD Digital Read Packed Flags and State',CmdFmt(prng(0xf1001800,128,128),4,'UI','I')),
 
         # Analog PACKED DATA—READ
         # 32 Points per Module
         # 0x80 Module boundary
-        ('HD Analog Packed Value in EU',CmdFmt(prng(0xf1001000,128,128),4,'F','f')),
-        ('HD Digital Packed State',CmdFmt(prng(0xf1001800,128,128),4,'UI','I')),
+        ('HD Analog Read Packed Value in EU',CmdFmt(prng(0xf1001000,128,128),4,'F','f')),
+        ('HD Digital Read Packed State',CmdFmt(prng(0xf1001800,128,128),4,'UI','I')),
 
         # Alarm Event SetTINGS—READ/WRITE
         # 64 Alarms On 0x80 boundary
-        ('Deviation Alarm State',CmdFmt(prng(0xf1100000,128,64),4,'B','I')),
-        ('Enable Deviation Alarm',CmdFmt(prng(0xf1100004,128,64),4,'B','I')),
-        ('Previous Deviation Value',CmdFmt(prng(0xf1100008,128,64),4,'F','f')),
-        ('Deviation Amount',CmdFmt(prng(0xf110000C,128,64),4,'F','f')),
-        ('On Deviation Alarm Set Scratch Pad Bits',CmdFmt(prng(0xf1100010,128,64),8,'M','Q')),
-        ('On Deviation Alarm Clear Scratch Pad Bits',CmdFmt(prng(0xf1100018,128,64),8,'M','Q')),
-        ('High Alarm State',CmdFmt(prng(0xf1100020,128,64),4,'B','I')),
-        ('Enable High Alarm',CmdFmt(prng(0xf1100024,128,64),4,'B','I')),
-        ('High Alarm Setpoint',CmdFmt(prng(0xf1100028,128,64),4,'F','f')),
-        ('High Alarm Deadband',CmdFmt(prng(0xf110002C,128,64),4,'F','f')),
-        ('On High Alarm Set Scratch Pad Bits',CmdFmt(prng(0xf1100030,128,64),8,'M','Q')),
-        ('On High Alarm Clear Scratch Pad Bits',CmdFmt(prng(0xf1100038,128,64),8,'M','Q')),
-        ('Low Alarm State',CmdFmt(prng(0xf1100040,128,64),4,'B','I')),
-        ('Enable Low Alarm',CmdFmt(prng(0xf1100044,128,64),4,'B','I')),
-        ('Low Alarm Setpoint',CmdFmt(prng(0xf1100048,128,64),4,'F','f')),
-        ('Low Alarm Deadband',CmdFmt(prng(0xf110004C,128,64),4,'F','f')),
-        ('On Low Alarm Set Scratch Pad Bits',CmdFmt(prng(0xf1100050,128,64),8,'M','Q')),
-        ('On Low Alarm Clear Scratch Pad Bits',CmdFmt(prng(0xf1100058,128,64),8,'M','Q')),
-        ('Value Address',CmdFmt(prng(0xf1100060,128,64),4,'UI','I')),
-        ('Value Type',CmdFmt(prng(0xf1100064,128,64),4,'UI','I')),
-        ('Pad for alignment',CmdFmt(prng(0xf1100068,128,64),24,'–','24x')),
+        ('Alarm Deviation Alarm State',CmdFmt(prng(0xf1100000,128,64),4,'B','I')),
+        ('Alarm Enable Deviation Alarm',CmdFmt(prng(0xf1100004,128,64),4,'B','I')),
+        ('Alarm Previous Deviation Value',CmdFmt(prng(0xf1100008,128,64),4,'F','f')),
+        ('Alarm Deviation Amount',CmdFmt(prng(0xf110000C,128,64),4,'F','f')),
+        ('Alarm On Deviation Alarm Set Scratch Pad Bits',CmdFmt(prng(0xf1100010,128,64),8,'M','Q')),
+        ('Alarm On Deviation Alarm Clear Scratch Pad Bits',CmdFmt(prng(0xf1100018,128,64),8,'M','Q')),
+        ('Alarm High Alarm State',CmdFmt(prng(0xf1100020,128,64),4,'B','I')),
+        ('Alarm Enable High Alarm',CmdFmt(prng(0xf1100024,128,64),4,'B','I')),
+        ('Alarm High Alarm Setpoint',CmdFmt(prng(0xf1100028,128,64),4,'F','f')),
+        ('Alarm High Alarm Deadband',CmdFmt(prng(0xf110002C,128,64),4,'F','f')),
+        ('Alarm On High Alarm Set Scratch Pad Bits',CmdFmt(prng(0xf1100030,128,64),8,'M','Q')),
+        ('Alarm On High Alarm Clear Scratch Pad Bits',CmdFmt(prng(0xf1100038,128,64),8,'M','Q')),
+        ('Alarm Low Alarm State',CmdFmt(prng(0xf1100040,128,64),4,'B','I')),
+        ('Alarm Enable Low Alarm',CmdFmt(prng(0xf1100044,128,64),4,'B','I')),
+        ('Alarm Low Alarm Setpoint',CmdFmt(prng(0xf1100048,128,64),4,'F','f')),
+        ('Alarm Low Alarm Deadband',CmdFmt(prng(0xf110004C,128,64),4,'F','f')),
+        ('Alarm On Low Alarm Set Scratch Pad Bits',CmdFmt(prng(0xf1100050,128,64),8,'M','Q')),
+        ('Alarm On Low Alarm Clear Scratch Pad Bits',CmdFmt(prng(0xf1100058,128,64),8,'M','Q')),
+        ('Alarm Value Address',CmdFmt(prng(0xf1100060,128,64),4,'UI','I')),
+        ('Alarm Value Type',CmdFmt(prng(0xf1100064,128,64),4,'UI','I')),
+        ('Alarm Pad for alignment',CmdFmt(prng(0xf1100068,128,64),24,'–','24x')),
         # 0x80 Module boundary
 
         # Event Message Cfg—READ/WRITE
         # 128 Messages 0xc0 boundary
-        ('Current Message State',CmdFmt(prng(0xf1200000,192,128),4,'UI','I')),
-        ('Scratch Pad Bits Set',CmdFmt(prng(0xf1200004,192,128),4,'M','I')),
-        ('Scratch Pad Bits Clear',CmdFmt(prng(0xf120000C,192,128),4,'M','I')),
-        ('Enable Streaming',CmdFmt(prng(0xf1200014,192,128),4,'B','I')),
-        ('Stream Period in Seconds',CmdFmt(prng(0xf1200018,192,128),4,'UI','I')),
-        ('Enable EMail',CmdFmt(prng(0xf120001C,192,128),4,'B','I')),
-        ('EMail Period in Seconds',CmdFmt(prng(0xf1200020,192,128),4,'UI','I')),
-        ('Enable SNMP Trap',CmdFmt(prng(0xf1200024,192,128),4,'B','I')),
-        ('SNMP trap Period in Seconds',CmdFmt(prng(0xf1200028,192,128),4,'UI','I')),
-        ('SNMP trap type',CmdFmt(prng(0xf120002C,192,128),4,'UI','I')),
-        ('Priority',CmdFmt(prng(0xf1200030,192,128),4,'UI','I')),
-        ('0xf1200034',CmdFmt(prng(0xf1200034,192,128),4,'–','4x')),
-        ('Enable serial Module Message',CmdFmt(prng(0xf1200038,192,128),4,'B','I')),
-        ('Serial Ports to Receive Message',CmdFmt(prng(0xf120003C,192,128),4,'M','I')),
-        ('Message Text',CmdFmt(prng(0xf1200040,192,128),128,'S-ZT','128s')),
+        ('Event Message Current State',CmdFmt(prng(0xf1200000,192,128),4,'UI','I')),
+        ('Event Message Scratch Pad Bits On Mask',CmdFmt(prng(0xf1200004,192,128),8,'M','Q')),
+        ('Event Message Scratch Pad Bits Off Mask',CmdFmt(prng(0xf120000C,192,128),8,'M','Q')),
+        ('Event Message Enable Streaming',CmdFmt(prng(0xf1200014,192,128),4,'B','I')),
+        ('Event Message Stream Period in Seconds',CmdFmt(prng(0xf1200018,192,128),4,'UI','I')),
+        ('Event Message Enable EMail',CmdFmt(prng(0xf120001C,192,128),4,'B','I')),
+        ('Event Message EMail Period',CmdFmt(prng(0xf1200020,192,128),4,'UI','I')),
+        ('Event Message Enable SNMP Trap',CmdFmt(prng(0xf1200024,192,128),4,'B','I')),
+        ('Event Message SNMP trap Period',CmdFmt(prng(0xf1200028,192,128),4,'UI','I')),
+        ('Event Message SNMP trap type',CmdFmt(prng(0xf120002C,192,128),4,'UI','I')),
+        ('Event Message Priority',CmdFmt(prng(0xf1200030,192,128),4,'UI','I')),
+        ('Event Message 0xf1200034',CmdFmt(prng(0xf1200034,192,128),4,'–','4x')),
+        ('Event Message Enable serial Module',CmdFmt(prng(0xf1200038,192,128),4,'B','I')),
+        ('Event Message Serial Ports to Receive',CmdFmt(prng(0xf120003C,192,128),4,'M','I')),
+        ('Event Message Text',CmdFmt(prng(0xf1200040,192,128),128,'S-ZT','128s')),
 
         # 128 destinations 0x10 boundary
         ('Destination Memory map Address',CmdFmt(prng(0xf1208000,16,128),4,'UI','I')),
@@ -1273,7 +1523,7 @@ class OmmpNET:
         ('EMAIL TO: Address',CmdFmt(prng(0xf1300008),50,'S-ZT','50s')),        
         ('EMAIL FROM: I/O Unit',CmdFmt(prng(0xf130003A),50,'S-ZT','50s')),
         ('EMAIL RE: Subject',CmdFmt(prng(0xf130006C),50,'S-ZT','50s')),
-        ('EMAIL EMail Response Timeout',CmdFmt(prng(0xf13000A0),4,'UI','I')),
+        ('EMAIL Response Timeout',CmdFmt(prng(0xf13000A0),4,'UI','I')),
         
         # SERIAL EVENT CONFIGURATION—READ/WRITE
         # 32 serial events on 0x74 boundary
@@ -1511,4 +1761,8 @@ class OmmpNET:
         ('ENET Secondary DNS server address',CmdFmt(prng(0xFFFFF070),8,'IP','4H')),
         ])
 
-om = OmmpNET()
+
+if __name__ == "__main__":                 
+    # createthe OmmpNET object
+    om = OmmpNET()
+    aa = ('192.168.10.225',2001)
